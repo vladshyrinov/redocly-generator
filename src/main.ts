@@ -182,6 +182,7 @@ function runRealmDevelop(
             reject(output);
           }
 
+          // For now even info messages are considered as errors, so this should be fixed on the level of redocly/realm
           if (output.includes("Status: No errors found")) {
             process.kill();
             resolve(null);
