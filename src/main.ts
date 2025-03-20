@@ -178,8 +178,6 @@ function runRealmDevelop(
 
           // Check for specific error pattern
           if (output.includes("❌")) {
-            console.error(output);
-            // Handle the specific error case here
             process.kill();
             reject(output);
           }
