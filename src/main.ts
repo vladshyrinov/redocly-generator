@@ -1,8 +1,22 @@
+import { spawn } from "child_process";
+
 const dotenv = require("dotenv");
 const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+
+enum CHILD_PROCESS_MODE {
+  EXEC = "EXEC",
+  SPAWN = "SPAWN",
+}
+
+enum STEP {
+  GENERATE_PROJECT_STRUCTURE = "generateProjectStructure",
+  GENERATE_FILE_CREATION_SCRIPT = "generateFileCreationScript",
+  EXECUTE_GENERATED_SCRIPT = "executeGeneratedScript",
+  RUN_REALM_DEVELOP = "runRealmDevelop",
+}
 
 // Load environment variables from .env file
 dotenv.config();
@@ -14,7 +28,31 @@ if (!GEMINI_API_KEY) {
   process.exit(1);
 }
 
+// Parse command-line arguments
+const args = process.argv.slice(2);
+const dirIndex =
+  args.indexOf("-d") !== -1 ? args.indexOf("-d") : args.indexOf("--directory");
+let isProjectDirectoryPathSpecified = dirIndex !== -1 && args[dirIndex + 1];
+let projectDir = isProjectDirectoryPathSpecified
+  ? args[dirIndex + 1]
+  : "realm-project";
+
+const STEP_TRY_LIMIT = 3;
+let currentStepTrial = 0;
+
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
+function checkStepTrialsLeft() {
+  return STEP_TRY_LIMIT - currentStepTrial > 0;
+}
+
+function increaseStepTrials() {
+  currentStepTrial++;
+}
+
+function resetStepTrials() {
+  currentStepTrial = 0;
+}
 
 // AI prompt to generate project structure and file content
 async function generateProjectStructure(): Promise<Record<string, string>> {
@@ -56,7 +94,7 @@ async function generateFileCreationScript(
 
   const prompt = `
   Generate a Node.js script that will:
-  1. Create a folder called "realm-project".
+  1. Create a folder called ${projectDir}.
   2. Create the following files with their respective content:
 
   ${JSON.stringify(files, null, 2)}
@@ -101,75 +139,175 @@ function executeGeneratedScript(script: string): boolean {
   }
 }
 
-// Runs the Redocly Realm development server
-function runRealmDevelop(projectDir: string): boolean {
-  try {
-    console.log(
-      `Launching @redocly/realm develop from directory: ${projectDir}`
-    );
-    execSync(`npx @redocly/realm develop -d ${projectDir}`, {
-      stdio: "inherit",
-    });
-    return true;
-  } catch (error) {
-    console.error("Error running @redocly/realm develop:", error);
-    return false;
+function runRealmDevelop(
+  directory: string,
+  mode: CHILD_PROCESS_MODE
+): Promise<string | null> {
+  console.log(
+    `Launching @redocly/realm develop from directory: ${projectDir}, in mode ${mode}`
+  );
+
+  if (mode === CHILD_PROCESS_MODE.EXEC) {
+    try {
+      console.log(
+        `Launching @redocly/realm develop from directory: ${projectDir}`
+      );
+      execSync(`npx @redocly/realm develop -d ${projectDir}`, {
+        stdio: "inherit",
+      });
+      return Promise.resolve(null);
+    } catch (error) {
+      console.error("Error running @redocly/realm develop:", error);
+      return Promise.reject(error);
+    }
   }
+
+  if (mode === CHILD_PROCESS_MODE.SPAWN) {
+    return new Promise((resolve, reject) => {
+      try {
+        // execSync(`npx @redocly/realm develop -d ${directory}`, { stdio: "inherit" });
+        const process = spawn(
+          "npx",
+          ["@redocly/realm", "develop", "-d", directory],
+          { stdio: "pipe" }
+        );
+
+        process.stderr?.on("data", (data) => {
+          const output = data.toString();
+          console.error(output); // Log standard error
+
+          // Check for specific error pattern
+          if (output.includes("❌")) {
+            console.error(output);
+            // Handle the specific error case here
+            process.kill();
+            reject(output);
+          }
+
+          if (output.includes("Status: No errors found")) {
+            process.kill();
+            resolve(null);
+          }
+        });
+      } catch (error) {
+        console.error("Error running @redocly/realm develop:", error);
+      }
+    });
+  }
+
+  throw new Error("Invalid mode specified.");
 }
 
 // Main AI agent loop
 async function main() {
-  let projectFiles, fileCreationScript, success, projectDir;
-  
-  // Step 1: Generate project structure
-  while (true) {
-    try {
-      console.log("Generating project structure...");
-      projectFiles = await generateProjectStructure();
-      break;
-    } catch (error) {
-      console.error("Error generating project structure. Retrying...");
+  let step = STEP.GENERATE_PROJECT_STRUCTURE;
+  let projectFiles, fileCreationScript, success;
+
+  while (checkStepTrialsLeft()) {
+    // Step 1: Generate project structure only if no directory is specified
+    if (step === STEP.GENERATE_PROJECT_STRUCTURE) {
+      if (!isProjectDirectoryPathSpecified) {
+        try {
+          increaseStepTrials();
+          console.log("Generating project structure...");
+          projectFiles = await generateProjectStructure();
+          resetStepTrials();
+          step = STEP.GENERATE_FILE_CREATION_SCRIPT;
+        } catch (error) {
+          console.error("Error generating project structure. Retrying...");
+        }
+      } else {
+        step = STEP.GENERATE_FILE_CREATION_SCRIPT;
+        console.log(
+          `Skipping project structure generation. Using existing directory: ${projectDir}`
+        );
+      }
+    }
+
+    // Step 2: Generate file creation script
+    if (step === STEP.GENERATE_FILE_CREATION_SCRIPT) {
+      try {
+        increaseStepTrials();
+        console.log("Generating file creation script...");
+        fileCreationScript = await generateFileCreationScript(
+          projectFiles || {}
+        );
+        resetStepTrials();
+        step = STEP.EXECUTE_GENERATED_SCRIPT;
+      } catch (error) {
+        console.error("Error generating file creation script. Retrying...");
+      }
+    }
+
+    // Step 3: Execute the generated script
+    if (step === STEP.EXECUTE_GENERATED_SCRIPT) {
+      try {
+        increaseStepTrials();
+        console.log("Executing script to create files...");
+
+        if (!fileCreationScript) {
+          throw new Error("File creation script is undefined.");
+        }
+
+        success = executeGeneratedScript(fileCreationScript);
+        if (success) {
+          resetStepTrials();
+          step = STEP.RUN_REALM_DEVELOP;
+        } else throw new Error("Execution failed.");
+      } catch (error) {
+        console.error("Error executing script. Retrying...");
+      }
+    }
+
+    // Step 4: Launch the Redocly Realm development server
+    if (step === STEP.RUN_REALM_DEVELOP) {
+      try {
+        increaseStepTrials();
+        console.log("Launching @redocly/realm develop...");
+
+        let errorStatus = await runRealmDevelop(
+          projectDir,
+          CHILD_PROCESS_MODE.SPAWN
+        );
+        if (!errorStatus) {
+          errorStatus = await runRealmDevelop(
+            projectDir,
+            CHILD_PROCESS_MODE.EXEC
+          );
+          resetStepTrials();
+          break;
+        }
+
+        if (errorStatus) {
+          new Error("@redocly/realm develop failed.");
+        }
+      } catch (error) {
+        console.error("ERROR", error);
+
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
+
+        // TODO: Get more details about error, instead of general error message,
+        // based on these more details you could work on investigation and futher steps
+        // to fix the real issues, for now for simplicity we are just asking for help to fix the error to show it
+        // and will generate a simple project instead of the one that failed.
+        const prompt = `
+          I need you to analyze the error from @redocly/realm develop and fix it ${error}
+        `;
+
+        try {
+          const result = await model.generateContent(prompt);
+          console.log(result.response.text());
+        } catch (error) {
+          console.error("Error generating AI file creation script:", error);
+          throw error;
+        }
+
+        isProjectDirectoryPathSpecified = false;
+        step = STEP.GENERATE_PROJECT_STRUCTURE;
+        console.error("Error launching @redocly/realm develop. Retrying...");
+      }
     }
   }
-
-  // Step 2: Generate file creation script
-  while (true) {
-    try {
-      console.log("Generating file creation script...");
-      fileCreationScript = await generateFileCreationScript(projectFiles);
-      break;
-    } catch (error) {
-      console.error("Error generating file creation script. Retrying...");
-    }
-  }
-
-  // Step 3: Execute the generated script
-  while (true) {
-    try {
-      console.log("Executing script to create files...");
-      success = executeGeneratedScript(fileCreationScript);
-      if (success) break;
-      else throw new Error("Execution failed.");
-    } catch (error) {
-      console.error("Error executing script. Retrying...");
-    }
-  }
-
-  // Step 4: Launch the Redocly Realm development server
-  while (true) {
-    try {
-      console.log("Launching @redocly/realm develop...");
-      projectDir = "realm-project"; // Directory where the files are created
-      success = runRealmDevelop(projectDir);
-      if (success) break;
-      else throw new Error("@redocly/realm develop failed.");
-    } catch (error) {
-      console.error("Error launching @redocly/realm develop. Retrying...");
-    }
-  }
-
-  console.log("Project successfully launched!");
 }
-
 
 main().catch(console.error);

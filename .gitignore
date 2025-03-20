@@ -19,5 +19,5 @@ yarn-error.log*
 Thumbs.db
 
 # Project generation artifacts
-realm-project
+realm-project*
 redocly-realm-script.js
